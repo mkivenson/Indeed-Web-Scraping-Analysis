@@ -1,0 +1,527 @@
+---
+title: "Indeed Web Scraping and Analysis"
+author: "Mary Anna Kivenson"
+date: "3/17/2019"
+output:
+  html_document:
+    highlight: pygments
+    theme: united
+    css: styles.css
+    toc: true
+    toc_float: true
+    code_folding: show
+  pdf_document: default
+  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This project will scrape job postings from Indeed and store them on an AWS PostgreSQL server in order to determine which skills are most important for aspiring data scientists.
+
+```{r packages, message=FALSE, warning=FALSE}
+library(rvest)
+library(tidyverse)
+library(data.table)
+library(DT)
+library(magrittr)
+library(digest)
+library(RPostgreSQL)
+library(tidytext)
+library(config)
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(RColorBrewer)
+library(RCurl)
+library(XML)
+library(stringr)
+library(zoo)
+library(ggplot2)
+library(knitr)
+```
+
+## Web Scraping Indeed 
+To obtain the latest available information about data science job postings, 50 pages of the latest Indeed job postings are scraped using various html nodes in the rvest package. The resulting dataset contains the following fields: job title, company, location, job summary, and link. To identify the correct html nodes that return these fields, the chrome extention *SelectorGadget* was used in conjunction with *inspect element*. Regular expressions are also used for each field to remove blank spaces, new lines, and unnecessary information.
+
+```{r job-summaries, eval=TRUE, message=FALSE, warning=FALSE, include=TRUE}
+listings <- data.frame(title=character(),
+                 company=character(), 
+                 location=character(), 
+                 summary=character(), 
+                 link=character(), 
+                 description = character(),
+                 stringsAsFactors=FALSE) 
+for (i in seq(0, 990, 10)){
+  url_ds <- paste0('https://www.indeed.com/jobs?q=data+scientist&l=all&start=',i)
+  var <- read_html(url_ds)
+  
+  #job title
+  title <-  var %>% 
+    html_nodes('#resultsCol .jobtitle') %>%
+    html_text() %>%
+    str_extract("(\\w+.+)+") 
+  
+  #company
+  company <- var %>% 
+    html_nodes('#resultsCol .company') %>%
+    html_text() %>%
+    str_extract("(\\w+).+") 
+  
+  #location
+  location <- var %>%
+    html_nodes('#resultsCol .location') %>%
+    html_text() %>%
+    str_extract("(\\w+.)+,.[A-Z]{2}")   
+  #summary
+  summary <- var %>%
+    html_nodes('#resultsCol .summary') %>%
+    html_text() %>%
+    str_extract(".+")
+  
+  #link
+  link <- var %>%
+    html_nodes('#resultsCol .jobtitle .turnstileLink, #resultsCol a.jobtitle') %>%
+    html_attr('href') 
+  link <- paste0("https://www.indeed.com",link)
+    
+  listings <- rbind(listings, as.data.frame(cbind(title,
+                                                  company,
+                                                  location,
+                                                  summary,
+                                                  link)))
+}
+```
+
+I have successfully scraped job title, company, location, job summary, and job link from 100 pages of Indeed job postings.
+
+```{r dataframe}
+datatable(listings)
+```
+
+### Creating a Unique ID for Each Job Listing
+
+I create a unique ID for each listing based on title, location, company, summary, and description. This unique ID will be used to remove duplicates (since many sponsored posts show up multiple times in Indeed's postings).
+
+```{r deduplicate}
+#create a unique id for each job posting attribute combination
+listings$uniqueid <- mapply(function(x, y, z) digest(paste0(x,y,z)), listings$title, listings$location, listings$company)
+#remove duplicate unique ids
+listings %<>%
+  distinct(uniqueid, .keep_all = TRUE)
+#remove duplicate links
+listings %<>%
+  distinct(link, .keep_all = TRUE)
+datatable(listings)
+```
+
+### Scraping Individual Listings for Full Descriptions
+The summaries provided in the main job listing pages are somewhat limited. Links to each individual job posting were also extracted in the previous step, so it is possible to iterate theough each link and scrape the full job description. To do this, duplicates are removed and rvest is used again to extract full descriptions.
+
+```{r crawl, eval=TRUE, message=FALSE, warning=FALSE, include=TRUE}
+#obtain full description for all job postings
+for (i in (1:length(listings$link))){
+  desciption <- tryCatch(
+     html_text(html_node(read_html(as.character(listings$link[i])),'.jobsearch-JobComponent-description')),
+     error=function(e){NA}
+  )
+  if (is.null(desciption)){
+    desc <- NA
+  }
+  listings$description[i] <- desciption
+}
+```
+
+```{r crawl-results}
+datatable(listings)
+```
+
+
+## Store Listings in AWS Server 
+
+Now that full job descriptions are available, regular expressions are used for some minor cleanup. Finally, I store the information from the web scraping in an SQL server. Rather than deleting the SQL table everytime this code chunk is run, I append the new listings to the existing SQL server. This allows any additional job listings to be captured without deleting older job listings. To prevent capturing duplicates in the SQL database, I use a temporary SQL table to identify which listings are not in the database already.
+
+
+```{r sqlimport, eval=FALSE, message=FALSE, warning=FALSE, include=TRUE, paged.print=TRUE}
+config <- config::get()
+
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, user=config$user, password=config$password, dbname=config$dbname, host= config$host)
+
+#Query to create new SQL table using uniqueid as the primary key
+sqltable <- "CREATE TABLE listings (
+ title TEXT,
+ company TEXT,
+ location TEXT,
+ summary TEXT,
+ link TEXT,
+ description TEXT,
+ uniqueid TEXT PRIMARY KEY
+)"
+
+#Creates new SQL table "listings" using the query above if it does not exist yet 
+if (!dbExistsTable(con, "listings")){
+  dbExecute(con, sqltable)
+}
+
+#Instead of dropping the table and creating a new one, I append records. Setting uniqueID as the primary key prevents appending duplicate job postings to the SQL database. This requires me to append a subset of job listings that are not duplicates. To do this, I create a temporary table to indentify and exclude duplicates - then import new listings into SQL.
+dbWriteTable(con, "dup_listings", listings, row.names = FALSE)
+dupcheck <- "
+SELECT
+  uniqueid,
+  MAX(title) as title,
+  MAX(company) as company,
+  MAX(location) as location,
+  MAX(summary) as summary,
+  MAX(link) as link,
+  MAX(description) as description
+FROM dup_listings
+WHERE uniqueid NOT IN (SELECT uniqueid FROM listings)
+GROUP BY uniqueid;
+"
+dupcheck_results <- dbGetQuery(con, dupcheck)
+
+if (nrow(dupcheck_results) > 0) {
+  dbWriteTable(con, "listings", dupcheck_results, append = TRUE, row.names = FALSE)
+}
+dbRemoveTable(con, "dup_listings")
+dbDisconnect(con)
+```
+
+### Import Job Listings from SQL Server 
+
+This step imports all the unique data science job listings that I have saved in a SQL table. 
+
+```{r query, warning=FALSE}
+config <- config::get()
+
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, user=config$user, password=config$password, dbname=config$dbname, host= config$host)
+#Query to get all job listings from SQL database.
+sql <- " 
+    SELECT uniqueid, title, company, location, summary, link, description
+    FROM listings
+"
+#Show query results
+results <- dbGetQuery(con, sql)
+dbDisconnect(con)
+datatable(results)
+```
+
+## Identifying Valuable Skills
+
+
+### Word Cloud
+
+To see which keywords show up most frequenctly in job descriptions, I create a word cloud. From the word cloud, I see that some important skills for a data science are business, machine learning, teamwork, statistics, analytics, research, and modeling. Languages highlighted in the word cloud include Python, SQL, and Java. This word cloud only provides a high-level summary of skills - for a more in-depth analysis, I will search for specific keywords. Note - R is filtered out of this word cloud. The word cloud function is from sthda.com. 
+
+
+```{r wc-function, eval=TRUE, warning=FALSE, include=FALSE}
+#++++++++++++++++++++++++++++++++++
+# rquery.wordcloud() : Word cloud generator
+# - http://www.sthda.com
+#+++++++++++++++++++++++++++++++++++
+# x : character string (plain text, web url, txt file path)
+# type : specify whether x is a plain text, a web page url or a file path
+# lang : the language of the text
+# excludeWords : a vector of words to exclude from the text
+# textStemming : reduces words to their root form
+# colorPalette : the name of color palette taken from RColorBrewer package, 
+  # or a color name, or a color code
+# min.freq : words with frequency below min.freq will not be plotted
+# max.words : Maximum number of words to be plotted. least frequent terms dropped
+# value returned by the function : a list(tdm, freqTable)
+rquery.wordcloud <- function(x, type=c("text", "url", "file"), 
+                          lang="english", excludeWords=NULL, 
+                          textStemming=FALSE,  colorPalette="Dark2",
+                          min.freq=3, max.words=200)
+{ 
+  library("tm")
+  library("SnowballC")
+  library("wordcloud")
+  library("RColorBrewer") 
+  
+  if(type[1]=="file") text <- readLines(x)
+  else if(type[1]=="url") text <- html_to_text(x)
+  else if(type[1]=="text") text <- x
+  
+  # Load the text as a corpus
+  docs <- Corpus(VectorSource(text))
+  # Convert the text to lower case
+  docs <- tm_map(docs, content_transformer(tolower))
+  # Remove numbers
+  docs <- tm_map(docs, removeNumbers)
+  # Remove stopwords for the language 
+  docs <- tm_map(docs, removeWords, stopwords(lang))
+  # Remove punctuations
+  docs <- tm_map(docs, removePunctuation)
+  # Eliminate extra white spaces
+  docs <- tm_map(docs, stripWhitespace)
+  # Remove your own stopwords
+  if(!is.null(excludeWords)) 
+    docs <- tm_map(docs, removeWords, excludeWords) 
+  # Text stemming
+  if(textStemming) docs <- tm_map(docs, stemDocument)
+  # Create term-document matrix
+  tdm <- TermDocumentMatrix(docs)
+  m <- as.matrix(tdm)
+  v <- sort(rowSums(m),decreasing=TRUE)
+  d <- data.frame(word = names(v),freq=v)
+  # check the color palette name 
+  if(!colorPalette %in% rownames(brewer.pal.info)) colors = colorPalette
+  else colors = brewer.pal(8, colorPalette) 
+  # Plot the word cloud
+  set.seed(1234)
+  wordcloud(d$word,d$freq, min.freq=min.freq, max.words=max.words,
+            random.order=FALSE, rot.per=0.35, 
+            use.r.layout=FALSE, colors=colors)
+  
+  invisible(list(tdm=tdm, freqTable = d))
+}
+#++++++++++++++++++++++
+# Helper function
+#++++++++++++++++++++++
+# Download and parse webpage
+html_to_text<-function(url){
+  library(RCurl)
+  library(XML)
+  # download html
+  html.doc <- getURL(url)  
+  #convert to plain text
+  doc = htmlParse(html.doc, asText=TRUE)
+ # "//text()" returns all text outside of HTML tags.
+ # I also don’t want text such as style and script codes
+  text <- xpathSApply(doc, "//text()[not(ancestor::script)][not(ancestor::style)][not(ancestor::noscript)][not(ancestor::form)]", xmlValue)
+  # Format text vector into one character string
+  return(paste(text, collapse = " "))
+}
+```
+
+
+```{r wordcloud, message=FALSE, warning=FALSE}
+res <- rquery.wordcloud(paste(results$description), type="text", 
+        lang="english", excludeWords = c("data", "experience","will","work"),
+        textStemming = FALSE,  colorPalette="Paired",
+        max.words=500)
+```
+
+### Keyword Search for Languages
+Below I search for occurance rates of specific languages. The majority of job postings mention R, Python, and/or SQL. Java, C++, and Scala are less commonly listed, but also seem to be useful skills for many job listings.
+
+```{r indeed_key, message=FALSE, warning=FALSE}
+#R
+r_listings_df <- results %>% 
+  filter(grepl(" R | R,", description, ignore.case=T) | grepl(" R | R,", summary, ignore.case=T))
+
+#Python
+python_listings_df <- results %>% 
+  filter(grepl(" python| python,", description, ignore.case=T) | grepl(" python| python,", summary, ignore.case=T))
+
+#Java
+java_listings_df <- results %>% 
+  filter(grepl(" java| java,", description, ignore.case=T) | grepl(" java| java,", summary, ignore.case=T))
+
+#SQL
+SQL_listings_df <- results %>% 
+  filter(grepl("SQL| SQL,", description, ignore.case=T) | grepl("SQL| SQL,", summary, ignore.case=T))
+
+#Scala
+scala_listings_df <- results %>% 
+  filter(grepl(" Scala| Scala,", description, ignore.case=T) | grepl(" Scala| Scala,", summary, ignore.case=T))
+
+#C++
+Cplusplus_listings_df <- results %>% 
+  filter(grepl("C\\+\\+| C\\+\\+,", description, ignore.case=T) | grepl("C\\+\\+| C\\+\\+,", summary, ignore.case=T))
+
+
+language_pct <- tibble(
+  language = c("R", "Python", "Java", "SQL", "Scala","C++"), 
+  mention_pct = c(round(nrow(r_listings_df)/nrow(results),digits=2), 
+                  round(nrow(python_listings_df)/nrow(results),digits=2), 
+                  round(nrow(java_listings_df)/nrow(results),digits=2), 
+                  round(nrow(SQL_listings_df)/nrow(results),digits=2), 
+                  round(nrow(scala_listings_df)/nrow(results),digits=2),
+                  round(nrow(Cplusplus_listings_df)/nrow(results),digits=2)))
+language_pct %>% ggplot(aes(x=language, y=mention_pct)) + 
+  geom_bar(stat="identity", position=position_dodge(), fill="steelblue") + 
+  labs(x = "Language", y = "Percent Mentioned")
+```
+
+
+### Keyword Search for Other Tools
+I also looked into the percent of job postings that mentioned tools such as Tableau, Spark, Hadoop, and SAS. These results show the prevalence of Big Data - given how often Spark and Hadoop are mentioned. 
+
+```{r indeed_key2}
+#Tableau
+tableau_listings_df <- results %>% 
+  filter(grepl("Tableau| Tableau,", description, ignore.case=T) | grepl("Tableau| Tableau,", summary, ignore.case=T))
+
+#Spark
+spark_listings_df <- results %>% 
+  filter(grepl("spark| spark,", description, ignore.case=T) | grepl("spark| spark,", summary, ignore.case=T))
+
+#Hadoop
+hadoop_listings_df <- results %>% 
+  filter(grepl("hadoop| hadoop,", description, ignore.case=T) | grepl("hadoop| hadoop,", summary, ignore.case=T))
+
+#SAS
+SAS_listings_df <- results %>% 
+  filter(grepl("sas| sas,", description, ignore.case=T) | grepl("sas| sas,", summary, ignore.case=T))
+
+#AWS
+AWS_listings_df <- results %>% 
+  filter(grepl(" AWS| Amazon Web Services", description, ignore.case=T) | grepl(" AWS| Amazon Web Services", summary, ignore.case=T))
+
+#Azure
+AWS_listings_df <- results %>% 
+  filter(grepl(" AWS| Amazon Web Services", description, ignore.case=T) | grepl(" AWS| Amazon Web Services", summary, ignore.case=T))
+
+#Excel
+Excel_listings_df <- results %>% 
+  filter(grepl(" excel | excel,", description, ignore.case=T) | grepl(" excel | excel,", summary, ignore.case=T))
+
+tools_pct <- tibble(
+  tool = c("Tableau", "Spark", "Hadoop", "SAS","Amazon Web Services","Excel"), 
+  
+  mention_pct = c(round(nrow(tableau_listings_df)/nrow(results),digits=2), 
+                  round(nrow(spark_listings_df)/nrow(results),digits=2), 
+                  round(nrow(hadoop_listings_df)/nrow(results),digits=2), 
+                  round(nrow(SAS_listings_df)/nrow(results),digits=2),
+                  round(nrow(AWS_listings_df)/nrow(results),digits=2),
+                  round(nrow(Excel_listings_df)/nrow(results),digits=2)))
+tools_pct %>% ggplot(aes(x=tool, y=mention_pct)) + 
+  geom_bar(stat="identity", position=position_dodge(), fill="maroon") + 
+  labs(x = "Tool", y = "Percent Mentioned")
+```
+
+### Keyword Search for Technical Topics
+As I saw in the word cloud above, Machine Learning is a common term mentioned in Indeed Data Science job listings. Which other technical topics are mentioned in job listings? Below I see that modeling, statistics, and visualization are key topics for data scientists. Big data and cloud technologies also have their place in the field of data science.
+
+```{r indeed_key3}
+#Big Data
+bigdata_listings_df <- results %>% 
+  filter(grepl("big data| big data,", description, ignore.case=T) | grepl("big data| big data,", summary, ignore.case=T))
+
+#Cloud
+cloud_listings_df <- results %>% 
+  filter(grepl("cloud| cloud,", description, ignore.case=T) | grepl("cloud| cloud,", summary, ignore.case=T))
+
+#Machine Learning
+ml_listings_df <- results %>% 
+  filter(grepl("machine learning", description, ignore.case=T) | grepl("machine learning", summary, ignore.case=T))
+
+#Regression Analysis
+regr_listings_df <- results %>% 
+  filter(grepl("regression| regression", description, ignore.case=T) | grepl("regression| regression", summary, ignore.case=T))
+
+#Artificial Intelligence
+ai_listings_df <- results %>% 
+  filter(grepl(" AI |Artificial Intelligence", description, ignore.case=T) | grepl(" AI |Artificial Intelligence", summary, ignore.case=T))
+
+#Statistics
+stat_listings_df <- results %>% 
+  filter(grepl("statistic", description, ignore.case=T) | grepl("statistic", summary, ignore.case=T))
+
+#Modeling
+model_listings_df <- results %>% 
+  filter(grepl("model", description, ignore.case=T) | grepl("model", summary, ignore.case=T))
+
+#Visualization
+viz_listings_df <- results %>% 
+  filter(grepl("visual", description, ignore.case=T) | grepl("visual", summary, ignore.case=T))
+
+tools_pct <- tibble(
+  tool = c("Big Data", "Cloud", "Machine Learning", "Regression","AI","Statistics","Modeling","Visualization"), 
+  mention_pct = c(round(nrow(bigdata_listings_df)/nrow(results),digits=2), 
+                  round(nrow(cloud_listings_df)/nrow(results),digits=2), 
+                  round(nrow(ml_listings_df)/nrow(results),digits=2), 
+                  round(nrow(regr_listings_df)/nrow(results),digits=2),
+                  round(nrow(ai_listings_df)/nrow(results),digits=2),
+                  round(nrow(stat_listings_df)/nrow(results),digits=2),
+                  round(nrow(model_listings_df)/nrow(results),digits=2),
+                  round(nrow(viz_listings_df)/nrow(results),digits=2)))
+tools_pct %>% ggplot(aes(x=tool, y=mention_pct)) + 
+  geom_bar(stat="identity", position=position_dodge(), fill="purple") + 
+  labs(x = "Technical Topic", y = "Percent Mentioned")
+```
+
+
+### Keyword Search for Soft Skills
+Which soft skills are important for data scienctists? I searched the occurance of multiple terms, such as communication, leadership, and problem solving. The key word search indicates that communication, leadership, and presentation skills are necessary for many job postings. Creativity and problem solving are also mentioned in a significant portion of job postings. On the other hand, teamwork seems to be a less valuable skill for data scientists!
+
+```{r indeed_key4}
+#Communication
+communication_listings_df <- results %>% 
+  filter(grepl("communication | communicate", description, ignore.case=T) | grepl("communication | communicate", summary, ignore.case=T))
+
+#Leadership
+leadership_listings_df <- results %>% 
+  filter(grepl("leadership | leader", description, ignore.case=T) | grepl("leadership | leader", summary, ignore.case=T))
+
+#Problem Solving
+problem_listings_df <- results %>% 
+  filter(grepl("problem solv", description, ignore.case=T) | grepl("problem solv", summary, ignore.case=T))
+
+#Presentation
+presentation_listings_df <- results %>% 
+  filter(grepl("present | presentation | public speak", description, ignore.case=T) | grepl("present | presentation | public speak", summary, ignore.case=T))
+
+#Teamwork
+teamwork_listings_df <- results %>% 
+  filter(grepl("teamwork", description, ignore.case=T) | grepl("teamwork", summary, ignore.case=T))
+
+#Adaptability
+adapt_listings_df <- results %>% 
+  filter(grepl("adapt", description, ignore.case=T) | grepl("adapt", summary, ignore.case=T))
+
+#Creativity
+creative_listings_df <- results %>% 
+  filter(grepl("creative | creativity", description, ignore.case=T) | grepl("creative | creativity", summary, ignore.case=T))
+
+tools_pct <- tibble(
+  tool = c("Communication", "Leadership", "Problem Solving", "Presentation","Teamwork","Adaptability","Creativity"), 
+  mention_pct = c(round(nrow(communication_listings_df)/nrow(results),digits=2), 
+                  round(nrow(leadership_listings_df)/nrow(results),digits=2), 
+                  round(nrow(problem_listings_df)/nrow(results),digits=2), 
+                  round(nrow(presentation_listings_df)/nrow(results),digits=2),
+                  round(nrow(teamwork_listings_df)/nrow(results),digits=2),
+                  round(nrow(adapt_listings_df)/nrow(results),digits=2),
+                  round(nrow(creative_listings_df)/nrow(results),digits=2)))
+tools_pct %>% ggplot(aes(x=tool, y=mention_pct)) + 
+  geom_bar(stat="identity", position=position_dodge(), fill="green") + 
+  labs(x = "Soft Skill", y = "Percent Mentioned")
+```
+
+### Number of Jobs by Location
+
+I thought it might be interesting to see the frequency of jobs by location. I wanted to see the frequency by both city and state, so I created two new data frames to look at this:
+
+```{r list_by_location, eval = TRUE, comment=NA}
+listings.city <- listings[,1:3]
+listings.state <- listings.city %>% separate(location, c("City","State"), sep = ",")
+```
+
+Now, I can create frequency tables for both:
+
+```{r freq_tables, eval = TRUE, comment=NA}
+locations.city <- as.data.frame(table(listings.city$location))
+locations.state <- as.data.frame(table(listings.state$State))
+head(locations.city[order(locations.city$Freq,decreasing = TRUE),],10)
+head(locations.state[order(locations.state$Freq,decreasing = TRUE),],10)
+```
+
+This shows that states with the highest amount of data science jobs are New York and California.
+Looking at data science jobs by city, it is evident that New York/Manhattan and San Francisco are a hub for data scientists.
+
+## Conclusion
+
+This examination of the data science job market involved gathering and cleaning three datasets of job listings. After storing, importing, tidying, and analyzing the data, I learned that:
+
+- Coveted data science skills include Python, R, SQL, Spark and Hadoop, among others.
+- High-ranking data science tops include Machine Learning, Statistics, and Modeling.
+- Important soft skills for data scientists are communication and leadership abilities. 
+
+Future analysis of interest might delve into various trends of popularity. Overall, the current landscape appears bright for data scientists.
